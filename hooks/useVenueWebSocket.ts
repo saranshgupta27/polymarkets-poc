@@ -1,6 +1,10 @@
 "use client";
 
-import { createKalshiWebSocket, parseKalshiOrderBook } from "@/api/kalshi";
+import {
+  createKalshiWebSocket,
+  fetchKalshiOrderBook,
+  parseKalshiOrderBook,
+} from "@/api/kalshi";
 import {
   createPolymarketWebSocket,
   parsePolymarketOrderBook,
@@ -168,7 +172,7 @@ export function useOrderBookData({
   }, [connectPolymarketWs]);
 
   // Kalshi/DFlow WebSocket connection
-  const connectKalshiWs = useCallback(() => {
+  const connectKalshiWs = useCallback(async () => {
     const kalshiTicker = linkedKalshiMarket?.ticker || market?.kalshi?.ticker;
     if (!kalshiTicker) return;
 
@@ -217,8 +221,26 @@ export function useOrderBookData({
           console.error("[Kalshi Hook] Max reconnect attempts reached");
         }
       },
-      () => {
+      async () => {
         console.log("[Kalshi Hook] WebSocket connected successfully");
+        
+        // Fetch initial orderbook via REST (DFlow WS only sends updates, not snapshots)
+        try {
+          console.log("[Kalshi Hook] Fetching initial orderbook via REST...");
+          const orderbookData = await fetchKalshiOrderBook(kalshiTicker);
+          const parsed = parseKalshiOrderBook(orderbookData);
+          dispatch(
+            orderBookActions.updateOrderBook({
+              venue: VENUES.KALSHI,
+              bids: parsed.bids,
+              asks: parsed.asks,
+            }),
+          );
+          console.log("[Kalshi Hook] Initial orderbook loaded");
+        } catch (error) {
+          console.error("[Kalshi Hook] Failed to fetch initial orderbook:", error);
+        }
+        
         dispatch(
           connectionActions.setConnectionStatus({
             venue: VENUES.KALSHI,

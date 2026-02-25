@@ -7,183 +7,201 @@ import {
   VenueOrderBook,
 } from "@/types/orderbook";
 
+// Combines order books from both venues by price level
 export function aggregateOrderBooks(
   polymarket: VenueOrderBook,
   kalshi: VenueOrderBook,
 ): { bids: AggregatedPriceLevel[]; asks: AggregatedPriceLevel[] } {
-  const aggregateLevels = (
-    polyLevels: PriceLevel[],
-    kalshiLevels: PriceLevel[],
-  ): AggregatedPriceLevel[] => {
-    const priceMap = new Map<number, AggregatedPriceLevel>();
+  function mergeByPrice(
+    polyOrders: PriceLevel[],
+    kalshiOrders: PriceLevel[],
+  ): AggregatedPriceLevel[] {
+    const combined = new Map<number, AggregatedPriceLevel>();
 
-    for (const level of polyLevels) {
-      const existing = priceMap.get(level.price);
-      if (existing) {
-        existing.totalSize += level.size;
-        existing.breakdown[VENUES.POLYMARKET] += level.size;
-      } else {
-        priceMap.set(level.price, {
-          price: level.price,
-          totalSize: level.size,
-          breakdown: {
-            [VENUES.POLYMARKET]: level.size,
-            [VENUES.KALSHI]: 0,
-          },
-        });
-      }
+    // Add Polymarket orders
+    for (const order of polyOrders) {
+      combined.set(order.price, {
+        price: order.price,
+        totalSize: order.size,
+        breakdown: {
+          [VENUES.POLYMARKET]: order.size,
+          [VENUES.KALSHI]: 0,
+        },
+      });
     }
 
-    for (const level of kalshiLevels) {
-      const existing = priceMap.get(level.price);
+    // Merge or add Kalshi orders
+    for (const order of kalshiOrders) {
+      const existing = combined.get(order.price);
       if (existing) {
-        existing.totalSize += level.size;
-        existing.breakdown[VENUES.KALSHI] += level.size;
+        existing.totalSize += order.size;
+        existing.breakdown[VENUES.KALSHI] = order.size;
       } else {
-        priceMap.set(level.price, {
-          price: level.price,
-          totalSize: level.size,
+        combined.set(order.price, {
+          price: order.price,
+          totalSize: order.size,
           breakdown: {
             [VENUES.POLYMARKET]: 0,
-            [VENUES.KALSHI]: level.size,
+            [VENUES.KALSHI]: order.size,
           },
         });
       }
     }
 
-    return Array.from(priceMap.values());
+    return Array.from(combined.values());
+  }
+
+  return {
+    bids: mergeByPrice(polymarket.bids, kalshi.bids).sort(
+      (a, b) => b.price - a.price, // Highest price first
+    ),
+    asks: mergeByPrice(polymarket.asks, kalshi.asks).sort(
+      (a, b) => a.price - b.price, // Lowest price first
+    ),
   };
-
-  const bids = aggregateLevels(polymarket.bids, kalshi.bids).sort(
-    (a, b) => b.price - a.price,
-  );
-
-  const asks = aggregateLevels(polymarket.asks, kalshi.asks).sort(
-    (a, b) => a.price - b.price,
-  );
-
-  return { bids, asks };
 }
 
+// Extracts best prices from aggregated order book
 export function getBestPrices(aggregated: {
   bids: AggregatedPriceLevel[];
   asks: AggregatedPriceLevel[];
-}): {
-  bestBid: number | null;
-  bestAsk: number | null;
-  spread: number | null;
-  midPrice: number | null;
-} {
+}) {
   const bestBid = aggregated.bids[0]?.price ?? null;
   const bestAsk = aggregated.asks[0]?.price ?? null;
+  
+  const hasValidPrices = bestBid !== null && bestAsk !== null;
 
-  const spread =
-    bestBid !== null && bestAsk !== null ? bestAsk - bestBid : null;
-  const midPrice =
-    bestBid !== null && bestAsk !== null ? (bestBid + bestAsk) / 2 : null;
-
-  return { bestBid, bestAsk, spread, midPrice };
+  return {
+    bestBid,
+    bestAsk,
+    spread: hasValidPrices ? bestAsk - bestBid : null,
+    midPrice: hasValidPrices ? (bestBid + bestAsk) / 2 : null,
+  };
 }
 
+// Convert YES bids to NO asks (buying YES = selling NO)
+function convertBidsToNoAsks(
+  bids: PriceLevel[],
+  venue: VenueId,
+): (PriceLevel & { venue: VenueId })[] {
+  return bids
+    .map((bid) => {
+      const yesPrice = bid.price;
+      const noPrice = 100 - yesPrice;
+
+      // Skip extreme prices
+      if (noPrice < 0.5 || yesPrice < 0.5) return null;
+
+      // Adjust size: $10 of YES at 10¢ = 100 shares, but same $10 at NO's 90¢ = 11.11 shares
+      const adjustedSize = (bid.size * noPrice) / yesPrice;
+
+      return {
+        price: noPrice,
+        size: adjustedSize,
+        venue,
+      };
+    })
+    .filter((order): order is NonNullable<typeof order> => order !== null);
+}
+
+// Get all available orders for the chosen outcome
+function getOrdersForOutcome(
+  outcome: OutcomeId,
+  polymarket: VenueOrderBook,
+  kalshi: VenueOrderBook,
+): (PriceLevel & { venue: VenueId })[] {
+  if (outcome === OUTCOMES.YES) {
+    // For YES: use asks (people selling YES)
+    const orders = [
+      ...polymarket.asks.map((ask) => ({ ...ask, venue: VENUES.POLYMARKET })),
+      ...kalshi.asks.map((ask) => ({ ...ask, venue: VENUES.KALSHI })),
+    ];
+    return orders.sort((a, b) => a.price - b.price); // Cheapest first
+  } else {
+    // For NO: use bids (people buying YES = selling NO)
+    const polyBidsAsNo = convertBidsToNoAsks(
+      polymarket.bids,
+      VENUES.POLYMARKET,
+    );
+    const kalshiBidsAsNo = convertBidsToNoAsks(kalshi.bids, VENUES.KALSHI);
+
+    return [...polyBidsAsNo, ...kalshiBidsAsNo].sort(
+      (a, b) => a.price - b.price, // Cheapest NO first
+    );
+  }
+}
+
+// Calculate quote: how many shares can I buy with $X?
 export function calculateQuote(
-  amountToSpend: number,
+  dollarAmount: number,
   outcome: OutcomeId,
   polymarket: VenueOrderBook,
   kalshi: VenueOrderBook,
 ): QuoteResult | null {
-  if (amountToSpend <= 0) {
-    return null;
-  }
+  if (dollarAmount <= 0) return null;
 
-  const allAsks: (PriceLevel & { venue: VenueId })[] = [
-    ...polymarket.asks.map((level) => ({
-      ...level,
-      venue: VENUES.POLYMARKET,
-    })),
-    ...kalshi.asks.map((level) => ({ ...level, venue: VENUES.KALSHI })),
-  ];
-
-  const relevantAsks =
-    outcome === OUTCOMES.YES
-      ? allAsks.sort((a, b) => a.price - b.price)
-      : allAsks
-          .map((ask) => {
-            const originalPrice = ask.price;
-            const invertedPrice = 100 - originalPrice;
-
-            if (invertedPrice < 0.5 || originalPrice < 0.5) {
-              return null;
-            }
-
-            const invertedSize = (ask.size * invertedPrice) / originalPrice;
-
-            return {
-              ...ask,
-              price: invertedPrice,
-              size: invertedSize,
-            };
-          })
-          .filter((ask): ask is NonNullable<typeof ask> => ask !== null)
-          .sort((a, b) => a.price - b.price);
+  const availableOrders = getOrdersForOutcome(
+    outcome,
+    polymarket,
+    kalshi,
+  );
 
   const fills: FillDetail[] = [];
-  let remainingAmount = amountToSpend;
-  let totalShares = 0;
-
-  const breakdown = {
+  const venueBreakdown = {
     [VENUES.POLYMARKET]: { shares: 0, spent: 0 },
     [VENUES.KALSHI]: { shares: 0, spent: 0 },
   };
 
-  for (const ask of relevantAsks) {
-    if (remainingAmount <= 0) break;
+  let remainingDollars = dollarAmount;
+  let totalShares = 0;
 
-    const priceInDollars = ask.price / 100;
+  // Fill orders from cheapest to most expensive
+  for (const order of availableOrders) {
+    if (remainingDollars <= 0) break;
 
-    if (priceInDollars < 0.005) {
-      continue;
-    }
+    const pricePerShare = order.price / 100; // Convert cents to dollars
 
-    const affordableSpend = Math.min(remainingAmount, ask.size);
-    const sharesToBuy = affordableSpend / priceInDollars;
+    // Skip unrealistic prices
+    if (pricePerShare < 0.005) continue;
 
-    if (sharesToBuy > 1000000) {
-      continue;
-    }
+    // How much of this order can we afford?
+    const spendOnThisOrder = Math.min(remainingDollars, order.size);
+    const sharesBought = spendOnThisOrder / pricePerShare;
 
-    if (sharesToBuy > 0 && isFinite(sharesToBuy)) {
-      fills.push({
-        venue: ask.venue,
-        price: ask.price,
-        size: affordableSpend,
-        shares: sharesToBuy,
-      });
+    // Skip unrealistic share amounts
+    if (sharesBought > 1_000_000 || !isFinite(sharesBought)) continue;
 
-      totalShares += sharesToBuy;
-      remainingAmount -= affordableSpend;
+    fills.push({
+      venue: order.venue,
+      price: order.price,
+      size: spendOnThisOrder,
+      shares: sharesBought,
+    });
 
-      breakdown[ask.venue].shares += sharesToBuy;
-      breakdown[ask.venue].spent += affordableSpend;
-    }
+    totalShares += sharesBought;
+    remainingDollars -= spendOnThisOrder;
+
+    venueBreakdown[order.venue].shares += sharesBought;
+    venueBreakdown[order.venue].spent += spendOnThisOrder;
   }
 
+  // Validate results
   if (fills.length === 0 || totalShares === 0 || !isFinite(totalShares)) {
     return null;
   }
 
-  const totalSpent = amountToSpend - remainingAmount;
-  const averagePrice =
-    totalSpent > 0 && totalShares > 0 ? (totalSpent / totalShares) * 100 : 0;
+  const totalSpent = dollarAmount - remainingDollars;
+  const avgPriceInCents = (totalSpent / totalShares) * 100;
 
-  if (!isFinite(averagePrice) || averagePrice < 0 || averagePrice > 100) {
+  if (!isFinite(avgPriceInCents) || avgPriceInCents < 0 || avgPriceInCents > 100) {
     return null;
   }
 
   return {
     totalShares,
-    averagePrice,
+    averagePrice: avgPriceInCents,
     fills,
-    breakdown,
+    breakdown: venueBreakdown,
   };
 }
 

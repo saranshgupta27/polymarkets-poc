@@ -48,30 +48,22 @@ export async function fetchPolymarketOrderBook(
   return response.json();
 }
 
+// Convert Polymarket API format (0.0-1.0) to our internal format (0-100 cents)
 export function parsePolymarketOrderBook(
   data: PolymarketOrderBookResponse,
 ): VenueOrderBook {
-  const bids: PriceLevel[] = data.bids.map((bid) => {
-    const price = parseFloat(bid.price) * 100;
+  function convertOrder(order: { price: string; size: string }): PriceLevel {
+    const priceInCents = parseFloat(order.price) * 100; // 0.5 -> 50¢
     return {
-      price: Math.round(price * 10) / 10,
-      size: parseFloat(bid.size),
+      price: Math.round(priceInCents * 10) / 10, // Round to 0.1¢ precision
+      size: parseFloat(order.size),
       venue: VENUES.POLYMARKET,
     };
-  });
-
-  const asks: PriceLevel[] = data.asks.map((ask) => {
-    const price = parseFloat(ask.price) * 100;
-    return {
-      price: Math.round(price * 10) / 10,
-      size: parseFloat(ask.size),
-      venue: VENUES.POLYMARKET,
-    };
-  });
+  }
 
   return {
-    bids: bids.sort((a, b) => b.price - a.price),
-    asks: asks.sort((a, b) => a.price - b.price),
+    bids: data.bids.map(convertOrder).sort((a, b) => b.price - a.price),
+    asks: data.asks.map(convertOrder).sort((a, b) => a.price - b.price),
     lastUpdated: Date.now(),
   };
 }

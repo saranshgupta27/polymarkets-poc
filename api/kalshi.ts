@@ -90,28 +90,37 @@ export async function fetchKalshiOrderBook(
   return response.json();
 }
 
+// Convert Kalshi/DFlow format to our internal format
+// DFlow separates yes_bids and no_bids; we convert to YES bids/asks
 export function parseKalshiOrderBook(
   data: DFlowOrderBookResponse,
 ): VenueOrderBook {
-  const bids: PriceLevel[] = Object.entries(data.yes_bids || {}).map(
-    ([priceStr, size]) => ({
-      price: Math.round(parseFloat(priceStr) * 100),
+  // YES bids: people buying YES
+  const yesBids: PriceLevel[] = Object.entries(data.yes_bids || {}).map(
+    ([price, size]) => ({
+      price: Math.round(parseFloat(price) * 100), // "0.50" -> 50¢
       size: size,
       venue: VENUES.KALSHI,
     }),
   );
 
-  const asks: PriceLevel[] = Object.entries(data.no_bids || {}).map(
-    ([priceStr, size]) => ({
-      price: 100 - Math.round(parseFloat(priceStr) * 100),
-      size: size,
-      venue: VENUES.KALSHI,
-    }),
+  // NO bids = people buying NO = people selling YES
+  // If someone bids 30¢ for NO, that means YES is at 70¢
+  const yesAsks: PriceLevel[] = Object.entries(data.no_bids || {}).map(
+    ([noBidPrice, size]) => {
+      const noPriceInCents = Math.round(parseFloat(noBidPrice) * 100);
+      const yesPriceInCents = 100 - noPriceInCents; // Complement
+      return {
+        price: yesPriceInCents,
+        size: size,
+        venue: VENUES.KALSHI,
+      };
+    },
   );
 
   return {
-    bids: bids.sort((a, b) => b.price - a.price),
-    asks: asks.sort((a, b) => a.price - b.price),
+    bids: yesBids.sort((a, b) => b.price - a.price),
+    asks: yesAsks.sort((a, b) => a.price - b.price),
     lastUpdated: Date.now(),
   };
 }
